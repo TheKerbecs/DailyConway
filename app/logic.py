@@ -6,7 +6,11 @@ import urllib.request
 import numpy as np
 from numba import njit, prange
 
-_VOID_HASH = "67f022195ee405142968ca1b53ae2513a8bab0404d70577785316fa95218e8ba"
+_VOID_GRID_ASCII = b"0" * 256
+
+def _compute_void_hash(salt_bytes: bytes) -> str:
+    """Compute the SHA-256 of an all-dead 16x16 grid combined with the given salt."""
+    return hashlib.sha256(_VOID_GRID_ASCII + salt_bytes).hexdigest()
 
 def fetch_nist_pulse():
     """Fetch the latest NIST beacon pulse for today's date."""
@@ -68,6 +72,7 @@ def step_grid_numba(grid):
 def play_game_of_life_fast(B_str: str, public_salt: str) -> dict:
     """Play Conway's Game of Life on a 16x16 grid mapped from a 256-bit binary string."""
     salt_bytes = public_salt.encode("ascii")
+    void_hash = _compute_void_hash(salt_bytes)
     grid = np.frombuffer(B_str.encode("ascii"), dtype=np.uint8) - 48
     grid = grid.reshape(16, 16).astype(np.int8)
 
@@ -95,7 +100,7 @@ def play_game_of_life_fast(B_str: str, public_salt: str) -> dict:
                 terminus = "3-FLICKER"
             elif delta == 64:
                 terminus = "GLIDER"
-            elif current_hash == _VOID_HASH:
+            elif current_hash == void_hash:
                 terminus = "VOID"
             else:
                 terminus = "UNKNOWN"
