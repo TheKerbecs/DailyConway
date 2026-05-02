@@ -269,7 +269,7 @@ class GPUMiner:
             except Exception as e:
                 await self._log(f"GoL failed: {e}")
 
-    async def run(self, target_suite: str, blocks: int, threads: int, ipt: int):
+    async def run(self, target_suite: str, blocks: int, threads: int, ipt: int, n_workers: int):
         """
         Orchestrate the continuous mining loop.
 
@@ -278,6 +278,7 @@ class GPUMiner:
             blocks (int): The number of CUDA blocks.
             threads (int): The number of threads per block.
             ipt (int): Iterations per thread (IPT). Hashes evaluated per thread.
+            n_workers (int): Number of CPU workers for the process pool.
         
         Raises:
             asyncio.CancelledError: When the overarching async task is canceled.
@@ -286,8 +287,6 @@ class GPUMiner:
         self.is_running = True
         hit_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         worker_tasks = []
-        cpu_cores = multiprocessing.cpu_count()
-        n_workers = max(1, cpu_cores - 1)
         process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=n_workers)
         
         try:
@@ -332,6 +331,7 @@ class GPUMiner:
             seen_b = set()
             last_rate_t = time.time()
             last_rate_hashes = 0
+            last_rate_hits = 0
             last_hit_broadcast = 0
 
             salt_len_arg = np.int32(len(salt_bytes))
@@ -367,10 +367,12 @@ class GPUMiner:
                 dt = now - last_rate_t
                 if dt >= 0.5:
                     rate = (total_hashes - last_rate_hashes) / dt
+                    hits_rate = (total_hits - last_rate_hits) / dt
                     last_rate_t = now
                     last_rate_hashes = total_hashes
+                    last_rate_hits = total_hits
                     if 'on_rate' in self.callbacks:
-                        await self.callbacks['on_rate'](rate)
+                        await self.callbacks['on_rate'](rate, hits_rate, hit_queue.qsize(), dropped)
                     print(f"[rate] {rate/1e6:.1f} M/s  total={total_hashes:,}  hits={total_hits}  q={hit_queue.qsize()}  dropped={dropped}")
 
                 if n_hits > 0 and host is not None:

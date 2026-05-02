@@ -78,6 +78,7 @@ HTML = """
             <label>Blocks: <input type="number" id="blocks" value="2048" min="32" max="65535" style="width: 80px;"></label>
             <label>Threads: <input type="number" id="threads" value="256" min="32" max="1024" step="32" style="width: 80px;"></label>
             <label>Iters/thread: <input type="number" id="ipt" value="256" min="1" max="4096" style="width: 80px;"></label>
+            <label>CPU Workers: <input type="number" id="workers" value="4" min="1" max="64" style="width: 60px;"></label>
             <button id="btnStart" class="start" onclick="sendCommand('start')">Start</button>
             <button id="btnStop" class="stop" onclick="sendCommand('stop')" disabled>Stop</button>
         </div>
@@ -95,7 +96,7 @@ HTML = """
                     <div class="stat-label">Submissions</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-val" id="totalHits" style="color: #f0883e;">0</div>
+                    <div class="stat-val" style="color: #f0883e;"><span id="totalHits">0</span> <span style="font-size: 14px; font-weight: normal; color: #8b949e;" id="hitsRate">(0.0/s)</span></div>
                     <div class="stat-label">Total Hits</div>
                 </div>
                 <div class="stat-box">
@@ -103,8 +104,8 @@ HTML = """
                     <div class="stat-label">Best Iterations</div>
                 </div>
                 <div class="stat-box">
-                    <div class="stat-val" id="kept">0</div>
-                    <div class="stat-label">In Top 500</div>
+                    <div class="stat-val" id="queueSize" style="color: #e3b341;">0</div>
+                    <div class="stat-label">Queue</div>
                 </div>
             </div>
             <div style="display: flex; gap: 15px; flex-wrap: wrap; flex: 0 0 auto;">
@@ -223,7 +224,7 @@ HTML = """
 
         function sendCommand(cmd) {
             const sv = document.getElementById('suiteSelect').value;
-            ws.send(JSON.stringify({ command: cmd, suite: sv === 'any' ? 'any' : parseInt(sv), blocks: parseInt(document.getElementById('blocks').value), threads: parseInt(document.getElementById('threads').value), ipt: parseInt(document.getElementById('ipt').value) }));
+            ws.send(JSON.stringify({ command: cmd, suite: sv === 'any' ? 'any' : parseInt(sv), blocks: parseInt(document.getElementById('blocks').value), threads: parseInt(document.getElementById('threads').value), ipt: parseInt(document.getElementById('ipt').value), workers: parseInt(document.getElementById('workers').value) }));
         }
 
         function submitMatch(matchId) { ws.send(JSON.stringify({ command: 'submit_match', match_id: matchId })); }
@@ -265,7 +266,11 @@ HTML = """
             else if (data.type === 'log') logToConsole(data.message);
             else if (data.type === 'rate') {
                 document.getElementById('hashRate').innerText = (data.rate / 1e6).toFixed(2) + ' M';
+                document.getElementById('hitsRate').innerText = '(' + (data.hits_rate || 0).toFixed(1) + '/s)';
+                document.getElementById('queueSize').innerText = data.queue || 0;
+
                 hashChart.data.datasets[0].data.shift(); hashChart.data.datasets[0].data.push(data.rate); hashChart.update();
+                
                 const buckets = Object.keys(iterHistData).map(Number).sort((a,b) => a-b);
                 if (buckets.length > 0) {
                     iterHistChart.data.labels = []; iterHistChart.data.datasets[0].data = [];
@@ -290,7 +295,7 @@ HTML = """
                 if (e) { e.uploaded = data.uploaded; scheduleRender(); }
             } else if (data.type === 'state_update') {
                 const r = data.is_running;
-                ['btnStart','btnStop','suiteSelect','blocks','threads','ipt'].forEach(id => document.getElementById(id).disabled = id==='btnStop' ? !r : r);
+                ['btnStart','btnStop','suiteSelect','blocks','threads','ipt','workers'].forEach(id => document.getElementById(id).disabled = id==='btnStop' ? !r : r);
             }
         };
 
@@ -370,9 +375,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 blocks = max(32, int(msg.get("blocks", 1024)))
                 threads = max(32, int(msg.get("threads", 256)))
                 ipt = max(1, int(msg.get("ipt", 64)))
+                workers = max(1, int(msg.get("workers", 4)))
                 
                 async def on_log(m: str): await broadcast_log(m)
-                async def on_rate(r: float): await broadcast({"type": "rate", "rate": r})
+                async def on_rate(r: float, hr: float, q: int, d: int): await broadcast({"type": "rate", "rate": r, "hits_rate": hr, "queue": q, "dropped": d})
                 async def on_hit_count(total: int): await broadcast({"type": "hit_count", "total": total})
                 async def on_match_history(mid: str, h: str, iters: int, peak: int, p: dict):
                     state.pending_payloads[mid] = p
@@ -388,7 +394,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 state.miner.is_running = True
                 await broadcast_state()
-                state.miner_task = asyncio.create_task(state.miner.run(target_suite, blocks, threads, ipt))
+                state.miner_task = asyncio.create_task(state.miner.run(target_suite, blocks, threads, ipt, workers))
 
             elif cmd == "stop":
                 if state.miner:
