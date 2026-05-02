@@ -142,6 +142,85 @@ def _play_gol_core(grid):
     return iteration, int(freq.max()), stat_min, stat_max, 0, grid
 
 
+@njit(cache=True, nogil=True, parallel=True)
+def _play_gol_batch_core(grids, out_iters, out_peaks, out_mins, out_maxs, out_deltas, out_final):
+    """
+    Run _play_gol_core on a batch of grids in parallel.
+
+    grids: (N, 16, 16) int8
+    out_*: (N,) preallocated output arrays
+    out_final: (N, 16, 16) int8 preallocated final-grid buffer
+    """
+    n = grids.shape[0]
+    for k in prange(n):
+        g = grids[k].copy()
+        it, peak, smin, smax, delta, final_g = _play_gol_core(g)
+        out_iters[k] = it
+        out_peaks[k] = peak
+        out_mins[k] = smin
+        out_maxs[k] = smax
+        out_deltas[k] = delta
+        for i in range(16):
+            for j in range(16):
+                out_final[k, i, j] = final_g[i, j]
+
+
+def play_game_of_life_batch(B_strs, public_salt: str):
+    """
+    Evaluate many boards in a single Numba call.
+
+    B_strs: list[str] of 256-char binary strings.
+    Returns: list[dict] with same shape as play_game_of_life_fast.
+    """
+    salt_bytes = public_salt.encode("ascii")
+    void_hash = _compute_void_hash(salt_bytes)
+    n = len(B_strs)
+    if n == 0:
+        return []
+
+    grids = np.empty((n, 16, 16), dtype=np.int8)
+    for k, b in enumerate(B_strs):
+        arr = np.frombuffer(b.encode("ascii"), dtype=np.uint8).astype(np.int8) - 48
+        grids[k] = arr.reshape(16, 16)
+
+    out_iters = np.zeros(n, dtype=np.int64)
+    out_peaks = np.zeros(n, dtype=np.int64)
+    out_mins = np.zeros(n, dtype=np.int64)
+    out_maxs = np.zeros(n, dtype=np.int64)
+    out_deltas = np.zeros(n, dtype=np.int64)
+    out_final = np.empty((n, 16, 16), dtype=np.int8)
+
+    _play_gol_batch_core(grids, out_iters, out_peaks, out_mins, out_maxs, out_deltas, out_final)
+
+    results = []
+    for k in range(n):
+        ascii_view = (out_final[k].reshape(-1) + 48).astype(np.uint8).tobytes()
+        current_hash = hashlib.sha256(ascii_view + salt_bytes).hexdigest()
+        delta = int(out_deltas[k])
+        if delta == 1:
+            terminus = "STATIC"
+        elif delta == 2:
+            terminus = "2-FLICKER"
+        elif delta == 3:
+            terminus = "3-FLICKER"
+        elif delta == 64:
+            terminus = "GLIDER"
+        elif current_hash == void_hash:
+            terminus = "VOID"
+        else:
+            terminus = "UNKNOWN"
+        smin = int(out_mins[k])
+        results.append({
+            "iterations": int(out_iters[k]),
+            "peak": int(out_peaks[k]),
+            "min": smin if smin != 999 else 0,
+            "max": int(out_maxs[k]),
+            "terminusHash": current_hash,
+            "terminus": terminus,
+        })
+    return results
+
+
 def play_game_of_life_fast(B_str: str, public_salt: str) -> dict:
     """Play Conway's Game of Life on a 16x16 grid mapped from a 256-bit binary string."""
     salt_bytes = public_salt.encode("ascii")

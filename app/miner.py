@@ -29,7 +29,7 @@ def _add_nvidia_dll_dirs():
 _add_nvidia_dll_dirs()
 
 import cupy as cp
-from .logic import play_game_of_life_fast, b_str_from_bytes, fetch_nist_pulse, get_target_strings
+from .logic import play_game_of_life_fast, play_game_of_life_batch, b_str_from_bytes, fetch_nist_pulse, get_target_strings
 
 KERNEL_SRC = r"""
 typedef unsigned char       uint8_t;
@@ -232,38 +232,59 @@ class GPUMiner:
 
     async def _gol_worker(self, public_salt: str, pulse_uri: str, hit_queue: asyncio.Queue, process_pool: concurrent.futures.ThreadPoolExecutor):
         """
-        Consume hashes from the queue and evaluate them using Conway's Game of Life.
-
-        Args:
-            public_salt (str): The daily salt used for hashing.
-            pulse_uri (str): The URI of the NIST beacon pulse.
-            hit_queue (asyncio.Queue): The queue providing raw GPU hits.
-            process_pool (concurrent.futures.ProcessPoolExecutor): The pool execution context.
+        Consume hashes from the queue in batches and evaluate them using Conway's Game of Life.
         """
+        BATCH_MAX = 256
         loop = asyncio.get_running_loop()
+        owner = os.environ.get("MINER_OWNER", "Unknown")
         while True:
             try:
-                item = await hit_queue.get()
-                if item is None:
+                first = await hit_queue.get()
+                if first is None:
                     return
-                b_str, gpu_hex, hit_target, hit_idx, attempts_at_hit = item
-                gol = await loop.run_in_executor(process_pool, play_game_of_life_fast, b_str, public_salt)
-                match_id = uuid.uuid4().hex
-                payload = {
-                    "owner": os.environ.get("MINER_OWNER", "Unknown"),
-                    "nist_pulse_id": pulse_uri,
-                    "salt_value": public_salt,
-                    "origin_hash": gpu_hex,
-                    "suite": str(len(hit_target)),
-                    "iterations": gol["iterations"],
-                    "peak": gol["peak"],
-                    "hash_index": hit_idx,
-                    "attempts": int(1),
-                    "bin": b_str,
-                    "terminus_hash": gol["terminusHash"],
-                }
-                if 'on_match_history' in self.callbacks:
-                    await self.callbacks['on_match_history'](match_id, gpu_hex, gol["iterations"], gol["peak"], payload)
+                batch = [first]
+                # Drain up to BATCH_MAX-1 more items without awaiting.
+                while len(batch) < BATCH_MAX:
+                    try:
+                        nxt = hit_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        # Re-queue sentinel for other workers; finish this batch first.
+                        try: hit_queue.put_nowait(None)
+                        except asyncio.QueueFull: pass
+                        break
+                    batch.append(nxt)
+
+                b_strs = [item[0] for item in batch]
+                gols = await loop.run_in_executor(
+                    process_pool, play_game_of_life_batch, b_strs, public_salt
+                )
+
+                items = []
+                for (b_str, gpu_hex, hit_target, hit_idx, attempts_at_hit), gol in zip(batch, gols):
+                    match_id = uuid.uuid4().hex
+                    payload = {
+                        "owner": owner,
+                        "nist_pulse_id": pulse_uri,
+                        "salt_value": public_salt,
+                        "origin_hash": gpu_hex,
+                        "suite": str(len(hit_target)),
+                        "iterations": gol["iterations"],
+                        "peak": gol["peak"],
+                        "hash_index": hit_idx,
+                        "attempts": 1,
+                        "bin": b_str,
+                        "terminus_hash": gol["terminusHash"],
+                    }
+                    items.append((match_id, gpu_hex, gol["iterations"], gol["peak"], payload))
+
+                if items:
+                    if 'on_match_history_batch' in self.callbacks:
+                        await self.callbacks['on_match_history_batch'](items)
+                    elif 'on_match_history' in self.callbacks:
+                        for it in items:
+                            await self.callbacks['on_match_history'](*it)
             except asyncio.CancelledError:
                 return
             except Exception as e:

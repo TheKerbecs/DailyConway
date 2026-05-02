@@ -26,6 +26,8 @@ class AppState:
         self.miner_task = None
         self.active_connections = []
         self.pending_payloads = {}  # match_id -> payload
+        self.match_buffer = []
+        self.match_flush_task = None
 
 state = AppState()
 
@@ -254,7 +256,7 @@ HTML = """
                 row.innerHTML = `<td style="padding: 8px; color: #8b949e;">${i++}</td><td style="padding: 8px; font-family: monospace; color: #c9d1d9;">${d.origin_hash.substring(0, 24)}…</td><td style="padding: 8px; color: #d2a8ff; font-weight: bold;">${d.iterations}</td><td style="padding: 8px;">${d.peak}</td><td style="padding: 8px; color: #8b949e;">${tStr}</td><td style="padding: 8px;">${actionCell}</td>`;
                 tbody.appendChild(row);
             }
-            document.getElementById('kept').innerText = historyData.length;
+            document.getElementById('kept') && (document.getElementById('kept').innerText = historyData.length);
         }
 
         let renderPending = false;
@@ -284,6 +286,33 @@ HTML = """
                 let bucket = Math.floor(data.iterations / 100) * 100;
                 iterHistData[bucket] = (iterHistData[bucket] || 0) + 1;
                 historyData.push({ match_id: data.match_id, origin_hash: data.origin_hash, iterations: data.iterations, peak: data.peak, uploaded: data.uploaded, time: data.time || Date.now(), bin: data.bin });
+                if (historyData.length > 500) {
+                    const uploaded = historyData.filter(d => d.uploaded), others = historyData.filter(d => !d.uploaded);
+                    others.sort((a, b) => b.iterations !== a.iterations ? b.iterations - a.iterations : (b.peak !== a.peak ? b.peak - a.peak : b.time - a.time));
+                    historyData = uploaded.concat(others.slice(0, Math.max(50, 500 - uploaded.length)));
+                }
+                scheduleRender();
+            } else if (data.type === 'match_history_batch') {
+                const now = Date.now();
+                const agg = data.agg;
+                if (agg) {
+                    if (agg.max_iters > bestIters) bestIters = agg.max_iters;
+                    if (agg.hist_delta) {
+                        for (const k in agg.hist_delta) {
+                            iterHistData[k] = (iterHistData[k] || 0) + agg.hist_delta[k];
+                        }
+                    }
+                } else {
+                    for (const m of data.items) {
+                        if (m.iterations > bestIters) bestIters = m.iterations;
+                        const bucket = Math.floor(m.iterations / 100) * 100;
+                        iterHistData[bucket] = (iterHistData[bucket] || 0) + 1;
+                    }
+                }
+                for (const m of data.items) {
+                    historyData.push({ match_id: m.match_id, origin_hash: m.origin_hash, iterations: m.iterations, peak: m.peak, uploaded: m.uploaded, time: m.time || now, bin: m.bin });
+                }
+                document.getElementById('bestIters').innerText = bestIters;
                 if (historyData.length > 500) {
                     const uploaded = historyData.filter(d => d.uploaded), others = historyData.filter(d => !d.uploaded);
                     others.sort((a, b) => b.iterations !== a.iterations ? b.iterations - a.iterations : (b.peak !== a.peak ? b.peak - a.peak : b.time - a.time));
@@ -323,6 +352,46 @@ async def broadcast(data: dict) -> None:
             dead.append(conn)
     for d in dead:
         state.active_connections.remove(d)
+
+
+async def _match_flusher():
+    """
+    Coalesce buffered match-history items and broadcast them at a bounded rate.
+
+    Sends at most ~5 messages/sec. Each message contains the top-N items by
+    iterations (rest are dropped from the UI feed but remain in pending_payloads),
+    plus aggregate stats so the histogram and best-iters counter stay accurate.
+    """
+    TOP_N = 50
+    INTERVAL = 0.2
+    try:
+        while True:
+            await asyncio.sleep(INTERVAL)
+            buf = state.match_buffer
+            if not buf:
+                continue
+            state.match_buffer = []
+            total = len(buf)
+            max_iters = 0
+            hist_delta: dict = {}
+            for m in buf:
+                it = m["iterations"]
+                if it > max_iters:
+                    max_iters = it
+                bucket = (it // 100) * 100
+                hist_delta[bucket] = hist_delta.get(bucket, 0) + 1
+            if total > TOP_N:
+                buf.sort(key=lambda m: m["iterations"], reverse=True)
+                items = buf[:TOP_N]
+            else:
+                items = buf
+            await broadcast({
+                "type": "match_history_batch",
+                "items": items,
+                "agg": {"count": total, "max_iters": max_iters, "hist_delta": hist_delta},
+            })
+    except asyncio.CancelledError:
+        return
 
 async def broadcast_log(msg: str):
     print(msg)
@@ -397,18 +466,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 async def on_hit_count(total: int): await broadcast({"type": "hit_count", "total": total})
                 async def on_match_history(mid: str, h: str, iters: int, peak: int, p: dict):
                     state.pending_payloads[mid] = p
-                    await broadcast({"type": "match_history", "match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": int(time.time() * 1000), "bin": p.get("bin")})
+                    state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": int(time.time() * 1000), "bin": p.get("bin")})
+                async def on_match_history_batch(items):
+                    now_ms = int(time.time() * 1000)
+                    for mid, h, iters, peak, p in items:
+                        state.pending_payloads[mid] = p
+                        state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": now_ms, "bin": p.get("bin")})
                 async def on_stop():
                     state.miner = None
+                    if state.match_flush_task:
+                        state.match_flush_task.cancel()
+                        state.match_flush_task = None
                     await broadcast_state()
                 
                 state.miner = GPUMiner(callbacks={
                     'on_log': on_log, 'on_rate': on_rate, 'on_hit_count': on_hit_count, 
-                    'on_match_history': on_match_history, 'on_stop': on_stop
+                    'on_match_history': on_match_history, 'on_match_history_batch': on_match_history_batch, 'on_stop': on_stop
                 })
                 
                 state.miner.is_running = True
                 await broadcast_state()
+                if state.match_flush_task is None or state.match_flush_task.done():
+                    state.match_flush_task = asyncio.create_task(_match_flusher())
                 state.miner_task = asyncio.create_task(state.miner.run(target_suite, blocks, threads, ipt, workers))
 
             elif cmd == "stop":
