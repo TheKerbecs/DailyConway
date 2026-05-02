@@ -230,7 +230,7 @@ class GPUMiner:
             self._kernel_module = cp.RawModule(code=KERNEL_SRC, options=("-std=c++14",))
             self._kernel_fn = self._kernel_module.get_function("mine")
 
-    async def _gol_worker(self, public_salt: str, pulse_uri: str, hit_queue: asyncio.Queue, process_pool: concurrent.futures.ProcessPoolExecutor):
+    async def _gol_worker(self, public_salt: str, pulse_uri: str, hit_queue: asyncio.Queue, process_pool: concurrent.futures.ThreadPoolExecutor):
         """
         Consume hashes from the queue and evaluate them using Conway's Game of Life.
 
@@ -285,9 +285,9 @@ class GPUMiner:
             Exception: If an unhandled error occurs during GPU launch or CPU processing.
         """
         self.is_running = True
-        hit_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
+        hit_queue: asyncio.Queue = asyncio.Queue(maxsize=500000)
         worker_tasks = []
-        process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=n_workers)
+        process_pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
         
         try:
             await self._log("Fetching NIST pulse from logic module...")
@@ -342,9 +342,9 @@ class GPUMiner:
             threads_t = (threads,)
 
             while self.is_running:
-                if hit_queue.qsize() >= 49000:
+                if hit_queue.qsize() >= hit_queue.maxsize-1000:
                     await self._log(f"Queue full ({hit_queue.qsize()}), pausing GPU...")
-                    while self.is_running and hit_queue.qsize() > 1000:
+                    while self.is_running and hit_queue.qsize() > 5000:
                         await asyncio.sleep(0.5)
                         now = time.time()
                         dt = now - last_rate_t

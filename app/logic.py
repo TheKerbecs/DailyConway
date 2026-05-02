@@ -48,26 +48,99 @@ def verify_hash(b_str: str, salt: str, expected_hex: str) -> bool:
     h = hashlib.sha256((b_str + salt).encode('ascii')).hexdigest()
     return h == expected_hex
 
-@njit(parallel=True)
+@njit(cache=True, nogil=True)
 def step_grid_numba(grid):
     n = np.empty_like(grid)
-    for i in prange(16):
+    for i in range(16):
+        i_prev = 15 if i == 0 else i - 1
+        i_next = 0 if i == 15 else i + 1
         for j in range(16):
-            i_prev = 15 if i == 0 else i - 1
-            i_next = 0 if i == 15 else i + 1
             j_prev = 15 if j == 0 else j - 1
             j_next = 0 if j == 15 else j + 1
-            
+
             neighbors = (grid[i_prev, j_prev] + grid[i_prev, j] + grid[i_prev, j_next] +
                          grid[i, j_prev]                       + grid[i, j_next] +
                          grid[i_next, j_prev] + grid[i_next, j] + grid[i_next, j_next])
-                         
+
             alive = grid[i, j]
             if alive:
                 n[i, j] = 1 if (neighbors == 2 or neighbors == 3) else 0
             else:
                 n[i, j] = 1 if neighbors == 3 else 0
     return n
+
+
+@njit(cache=True, nogil=True)
+def _play_gol_core(grid):
+    """
+    Run the full Game of Life loop inside Numba.
+
+    Returns: (iterations, peak, stat_min, stat_max, delta, final_grid)
+    where delta is the cycle length (1=STATIC, 2/3=FLICKER, 64=GLIDER, else UNKNOWN/VOID).
+    """
+    MAX_STATES = 16384
+    # Store visited states as 4 uint64s per state (256 bits = 16x16).
+    history = np.zeros((MAX_STATES, 4), dtype=np.uint64)
+    freq = np.zeros((16, 16), dtype=np.int32)
+    stat_min = 999
+    stat_max = 0
+    iteration = 0
+    delta = 0
+
+    while iteration < MAX_STATES:
+        # Pack grid into 4 uint64s (4 rows of 16 bits each = 64 bits per word).
+        w0 = np.uint64(0); w1 = np.uint64(0); w2 = np.uint64(0); w3 = np.uint64(0)
+        for i in range(4):
+            r = np.uint64(0)
+            for j in range(16):
+                r = (r << np.uint64(1)) | np.uint64(grid[i, j])
+            w0 = (w0 << np.uint64(16)) | r
+        for i in range(4, 8):
+            r = np.uint64(0)
+            for j in range(16):
+                r = (r << np.uint64(1)) | np.uint64(grid[i, j])
+            w1 = (w1 << np.uint64(16)) | r
+        for i in range(8, 12):
+            r = np.uint64(0)
+            for j in range(16):
+                r = (r << np.uint64(1)) | np.uint64(grid[i, j])
+            w2 = (w2 << np.uint64(16)) | r
+        for i in range(12, 16):
+            r = np.uint64(0)
+            for j in range(16):
+                r = (r << np.uint64(1)) | np.uint64(grid[i, j])
+            w3 = (w3 << np.uint64(16)) | r
+
+        alive = 0
+        for i in range(16):
+            for j in range(16):
+                alive += grid[i, j]
+
+        # Check for cycle.
+        for k in range(iteration):
+            if (history[k, 0] == w0 and history[k, 1] == w1 and
+                history[k, 2] == w2 and history[k, 3] == w3):
+                delta = iteration - k
+                return iteration, int(freq.max()), stat_min, stat_max, delta, grid
+
+        history[iteration, 0] = w0
+        history[iteration, 1] = w1
+        history[iteration, 2] = w2
+        history[iteration, 3] = w3
+
+        if alive < stat_min:
+            stat_min = alive
+        if alive > stat_max:
+            stat_max = alive
+        for i in range(16):
+            for j in range(16):
+                freq[i, j] += grid[i, j]
+
+        iteration += 1
+        grid = step_grid_numba(grid)
+
+    return iteration, int(freq.max()), stat_min, stat_max, 0, grid
+
 
 def play_game_of_life_fast(B_str: str, public_salt: str) -> dict:
     """Play Conway's Game of Life on a 16x16 grid mapped from a 256-bit binary string."""
@@ -76,49 +149,29 @@ def play_game_of_life_fast(B_str: str, public_salt: str) -> dict:
     grid = np.frombuffer(B_str.encode("ascii"), dtype=np.uint8) - 48
     grid = grid.reshape(16, 16).astype(np.int8)
 
-    past_grids: dict = {}
-    stat_min, stat_max = 999, 0
-    freq = np.zeros((16, 16), dtype=np.int32)
-    iteration = 0
+    iteration, peak, stat_min, stat_max, delta, final_grid = _play_gol_core(grid)
 
-    while True:
-        grid_bytes = grid.tobytes()
-        alive = int(grid.sum())
+    ascii_view = (final_grid.reshape(-1) + 48).astype(np.uint8).tobytes()
+    current_hash = hashlib.sha256(ascii_view + salt_bytes).hexdigest()
 
-        if grid_bytes in past_grids:
-            idx = past_grids[grid_bytes]
-            delta = iteration - idx
-            
-            ascii_view = (grid.reshape(-1) + 48).astype(np.uint8).tobytes()
-            current_hash = hashlib.sha256(ascii_view + salt_bytes).hexdigest()
-            
-            if delta == 1:
-                terminus = "STATIC"
-            elif delta == 2:
-                terminus = "2-FLICKER"
-            elif delta == 3:
-                terminus = "3-FLICKER"
-            elif delta == 64:
-                terminus = "GLIDER"
-            elif current_hash == void_hash:
-                terminus = "VOID"
-            else:
-                terminus = "UNKNOWN"
-            return {
-                "iterations": iteration,
-                "peak": int(freq.max()),
-                "min": stat_min,
-                "max": stat_max,
-                "terminusHash": current_hash,
-                "terminus": terminus,
-            }
+    if delta == 1:
+        terminus = "STATIC"
+    elif delta == 2:
+        terminus = "2-FLICKER"
+    elif delta == 3:
+        terminus = "3-FLICKER"
+    elif delta == 64:
+        terminus = "GLIDER"
+    elif current_hash == void_hash:
+        terminus = "VOID"
+    else:
+        terminus = "UNKNOWN"
 
-        past_grids[grid_bytes] = iteration
-        if alive < stat_min:
-            stat_min = alive
-        if alive > stat_max:
-            stat_max = alive
-        freq += grid
-        iteration += 1
-
-        grid = step_grid_numba(grid)
+    return {
+        "iterations": iteration,
+        "peak": peak,
+        "min": stat_min if stat_min != 999 else 0,
+        "max": stat_max,
+        "terminusHash": current_hash,
+        "terminus": terminus,
+    }
