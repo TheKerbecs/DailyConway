@@ -285,7 +285,7 @@ class GPUMiner:
             Exception: If an unhandled error occurs during GPU launch or CPU processing.
         """
         self.is_running = True
-        hit_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
+        hit_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
         worker_tasks = []
         process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=n_workers)
         
@@ -342,6 +342,24 @@ class GPUMiner:
             threads_t = (threads,)
 
             while self.is_running:
+                if hit_queue.qsize() >= 49000:
+                    await self._log(f"Queue full ({hit_queue.qsize()}), pausing GPU...")
+                    while self.is_running and hit_queue.qsize() > 1000:
+                        await asyncio.sleep(0.5)
+                        now = time.time()
+                        dt = now - last_rate_t
+                        if dt >= 0.5:
+                            hr = (total_hits - last_rate_hits) / dt
+                            last_rate_t = now
+                            last_rate_hits = total_hits
+                            if 'on_rate' in self.callbacks:
+                                await self.callbacks['on_rate'](0.0, hr, hit_queue.qsize(), dropped)
+                            print(f"[rate] 0.0 M/s  total={total_hashes:,}  hits={total_hits}  q={hit_queue.qsize()}  dropped={dropped}")
+                    if self.is_running:
+                        await self._log("Queue drained, resuming GPU...")
+                    else:
+                        break
+
                 d_result_count[:] = 0
                 seed_arg = np.uint64(base_seed)
                 base_seed = (base_seed + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
@@ -404,6 +422,20 @@ class GPUMiner:
                         last_hit_broadcast = total_hits
                         if 'on_hit_count' in self.callbacks:
                             await self.callbacks['on_hit_count'](total_hits)
+
+            if hit_queue.qsize() > 0:
+                await self._log(f"Stopping GPU, processing {hit_queue.qsize()} remaining items in queue...")
+                while hit_queue.qsize() > 0:
+                    await asyncio.sleep(0.5)
+                    now = time.time()
+                    dt = now - last_rate_t
+                    if dt >= 0.5:
+                        hr = (total_hits - last_rate_hits) / dt
+                        last_rate_t = now
+                        last_rate_hits = total_hits
+                        if 'on_rate' in self.callbacks:
+                            await self.callbacks['on_rate'](0.0, hr, hit_queue.qsize(), dropped)
+                        print(f"[rate] 0.0 M/s  total={total_hashes:,}  hits={total_hits}  q={hit_queue.qsize()}  dropped={dropped}")
 
             await self._log(f"Stopped. {total_hashes:,} hashes, {total_hits} hits, {dropped} dropped.")
         except asyncio.CancelledError:

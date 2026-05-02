@@ -129,7 +129,7 @@ HTML = """
             </div>
         </div>
         <div class="panel log-panel">
-            <h3 style="margin-top: 0; margin-bottom: 10px; font-size: 16px; color: #8b949e;">Mining Console</h3>
+            <h3 style="margin-top: 0; margin-bottom: 10px; font-size: 16px; color: #8b949e;">Console</h3>
             <textarea id="logs" readonly></textarea>
         </div>
     </div>
@@ -334,10 +334,25 @@ async def broadcast_state():
 
 async def submit_payload(payload: dict) -> bool:
     def post_data():
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-GB,en;q=0.8",
+            "Origin": "https://lifehashes.net",
+            "Referer": "https://lifehashes.net/dailychallenge/",
+            "sec-ch-ua": '"Brave";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "sec-gpc": "1"
+        }
         req = urllib.request.Request(
             "https://lifehashes.net/dailychallenge/save_glyph.php",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            headers=headers,
         )
         with urllib.request.urlopen(req) as resp:
             body = resp.read().decode()
