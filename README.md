@@ -1,6 +1,6 @@
 # DailyConway
 
-A hybrid GPU/CPU Conway's Game of Life cryptocurrency-style hash miner written in Python, featuring a bespoke hardware-accelerated CUDA kernel via `CuPy` and JIT compiled CPU simulation paths via `Numba`. Ships with a completely interactive, real-time metrics Web UI using FastAPI and WebSockets.
+A hybrid GPU/CPU Conway's Game of Life miner written in Python, featuring a hardware-accelerated CUDA kernel via `CuPy` and JIT compiled CPU simulation paths via `Numba`. Ships with a completely interactive, real-time metrics Web UI using FastAPI and WebSockets.
 
 ## Project Structure
 ```text
@@ -19,7 +19,7 @@ DailyConway/
 
 ## Installation
 
-This project utilizes `uv` for lightning-fast package management and uses the standalone `nvidia` package distribution alongside `CuPy` to dynamically locate DLLs on Windows without needing a manual CUDA toolkit installation.
+This project utilizes `uv` for package management and uses the standalone `nvidia` package distribution alongside `CuPy` to dynamically locate DLLs on Windows without needing a manual CUDA toolkit installation.
 
 ### Steps to Install
 
