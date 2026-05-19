@@ -270,14 +270,14 @@ class GPUMiner:
                         "salt_value": public_salt,
                         "origin_hash": gpu_hex,
                         "suite": str(len(hit_target)),
-                        "iterations": gol["iterations"],
+                        "iterations": gol["iterations"]-1,
                         "peak": gol["peak"],
                         "hash_index": hit_idx,
                         "attempts": 1,
                         "bin": b_str,
                         "terminus_hash": gol["terminusHash"],
                     }
-                    items.append((match_id, gpu_hex, gol["iterations"], gol["peak"], payload))
+                    items.append((match_id, gpu_hex, gol["iterations"]-1, gol["peak"], payload))
 
                 if items:
                     if 'on_match_history_batch' in self.callbacks:
@@ -479,3 +479,26 @@ class GPUMiner:
 
     def stop(self):
         self.is_running = False
+
+    async def evaluate_bin_string(self, b_str: str, public_salt: str | None = None) -> dict:
+        """
+        Evaluate a 256-character binary string through Conway's Game of Life and
+        return the result as a JSON-serialisable dict.
+
+        Args:
+            b_str (str): A 256-character string of '0'/'1' characters representing
+                         the initial 16×16 Game of Life grid.
+            public_salt (str | None): The NIST salt to use.  When *None* the
+                         current day's NIST pulse is fetched automatically.
+
+        Returns:
+            dict: GoL result with keys iterations, peak, min, max,
+                  terminusHash, terminus, bin, salt_value.
+        """
+        if public_salt is None:
+            _, public_salt = await asyncio.to_thread(fetch_nist_pulse)
+
+        result = await asyncio.to_thread(play_game_of_life_fast, b_str, public_salt)
+        result["bin"] = b_str
+        result["salt_value"] = public_salt
+        return result
