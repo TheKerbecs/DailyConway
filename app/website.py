@@ -28,6 +28,7 @@ class AppState:
         self.pending_payloads = {}  # match_id -> payload
         self.match_buffer = []
         self.match_flush_task = None
+        self.custom_mode = False
 
 state = AppState()
 
@@ -69,7 +70,7 @@ HTML = """
     <div class="header">
         <h2>GPU Conway Miner</h2>
         <div class="controls">
-            <label>Suite:
+            <label id="suiteLabel">Suite:
                 <select id="suiteSelect">
                     <option value="4">4</option>
                     <option value="6">6</option>
@@ -81,8 +82,60 @@ HTML = """
             <label>Threads: <input type="number" id="threads" value="256" min="32" max="1024" step="32" style="width: 80px;"></label>
             <label>Iters/thread: <input type="number" id="ipt" value="256" min="1" max="4096" style="width: 80px;"></label>
             <label>CPU Workers: <input type="number" id="workers" value="4" min="1" max="64" style="width: 60px;"></label>
+            <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;" title="Custom search: define hex-string constraints (front/back/any). All must match. No NIST salt. No submission, only Save File.">
+                <input type="checkbox" id="customMode" style="width: 16px; height: 16px; cursor: pointer;" onchange="onCustomToggle()">
+                <span>Custom Search</span>
+            </label>
             <button id="btnStart" class="start" onclick="sendCommand('start')">Start</button>
             <button id="btnStop" class="stop" onclick="sendCommand('stop')" disabled>Stop</button>
+        </div>
+    </div>
+
+    <div id="customControls" style="display:none; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 15px; margin-bottom:15px; flex-shrink:0;">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+            <strong style="color:#c9d1d9; font-size:14px;">Custom search mode:</strong>
+            <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+                <input type="radio" name="customKind" value="groups" checked onchange="onKindChange()"> <span>Groups (AND of OR)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
+                <input type="radio" name="customKind" value="regex" onchange="onKindChange()"> <span>Regex</span>
+            </label>
+        </div>
+
+        <div id="groupsPanel">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+                <span style="color:#8b949e; font-size:12px;">Groups are AND-ed; rows within a group are OR-ed.</span>
+                <button onclick="addGroup()" style="background:#1f6feb; color:white; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-size:12px;">+ AND group</button>
+            </div>
+            <div id="groupsList" style="display:flex; flex-direction:column; gap:10px;"></div>
+            <div id="exprPreview" style="margin-top:10px; font-family:ui-monospace,monospace; font-size:12px; color:#8b949e;"></div>
+        </div>
+
+        <div id="regexPanel" style="display:none;">
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                <label style="display:flex; flex-direction:column; gap:4px;">
+                    <span style="font-size:12px; color:#8b949e;">Pattern (Python <code>re</code> syntax)</span>
+                    <input id="regexPattern" type="text" placeholder="e.g. ^513.*(b0b1400|626f62696e6f75)" style="width:100%; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:8px; border-radius:4px; font-family:ui-monospace,monospace;">
+                </label>
+                <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                    <label style="display:flex; flex-direction:column; gap:4px; flex:0 0 120px;">
+                        <span style="font-size:12px; color:#8b949e;">Flags (i s m x)</span>
+                        <input id="regexFlags" type="text" maxlength="4" placeholder="e.g. i" style="background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:8px; border-radius:4px; font-family:ui-monospace,monospace;">
+                    </label>
+                    <label style="display:flex; flex-direction:column; gap:4px; flex:1; min-width:200px;" title="GPU pre-filter: a literal lowercase hex substring (1-16) that MUST appear somewhere in the hash. The full regex runs on the CPU on candidates. Required because regex on the GPU is impractical at 100M+ hashes/sec.">
+                        <span style="font-size:12px; color:#8b949e;">GPU pre-filter anchor (lowercase hex, 1-16) <span style="color:#f85149;">*required</span></span>
+                        <input id="regexAnchor" type="text" maxlength="16" placeholder="e.g. b0b1400" style="background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:8px; border-radius:4px; font-family:ui-monospace,monospace;">
+                    </label>
+                </div>
+                <div style="background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                        <span style="color:#8b949e; font-size:12px;">Live tester — paste a 64-char hex hash:</span>
+                        <span id="regexTestStatus" style="font-family:ui-monospace,monospace; font-size:12px;">—</span>
+                    </div>
+                    <textarea id="regexTestInput" rows="2" placeholder="51300000000b0b1400..." style="width:100%; background:#161b22; color:#c9d1d9; border:1px solid #30363d; padding:8px; border-radius:4px; font-family:ui-monospace,monospace; resize:vertical; box-sizing:border-box;"></textarea>
+                    <div id="regexTestDetail" style="margin-top:6px; font-family:ui-monospace,monospace; font-size:12px; color:#8b949e; word-break:break-all;"></div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -226,10 +279,267 @@ HTML = """
 
         function sendCommand(cmd) {
             const sv = document.getElementById('suiteSelect').value;
-            ws.send(JSON.stringify({ command: cmd, suite: sv === 'any' ? 'any' : parseInt(sv), blocks: parseInt(document.getElementById('blocks').value), threads: parseInt(document.getElementById('threads').value), ipt: parseInt(document.getElementById('ipt').value), workers: parseInt(document.getElementById('workers').value) }));
+            const customMode = document.getElementById('customMode').checked;
+            const payload = {
+                command: cmd,
+                suite: sv === 'any' ? 'any' : parseInt(sv),
+                blocks: parseInt(document.getElementById('blocks').value),
+                threads: parseInt(document.getElementById('threads').value),
+                ipt: parseInt(document.getElementById('ipt').value),
+                workers: parseInt(document.getElementById('workers').value),
+                custom_mode: customMode,
+            };
+            if (customMode && cmd === 'start') {
+                if (getKind() === 'regex') {
+                    const r = collectRegex();
+                    if (!r) return;
+                    payload.regex = r;
+                } else {
+                    const groups = collectGroups();
+                    if (!groups) return;
+                    payload.groups = groups;
+                }
+            }
+            ws.send(JSON.stringify(payload));
+        }
+
+        function getKind() {
+            const el = document.querySelector('input[name="customKind"]:checked');
+            return el ? el.value : 'groups';
+        }
+
+        function onKindChange() {
+            const kind = getKind();
+            document.getElementById('groupsPanel').style.display = (kind === 'groups') ? '' : 'none';
+            document.getElementById('regexPanel').style.display  = (kind === 'regex')  ? '' : 'none';
+            if (kind === 'regex' && !document.getElementById('regexPattern').value) {
+                document.getElementById('regexPattern').value = '^513.*(b0b1400|626f62696e6f75)';
+                document.getElementById('regexFlags').value = '';
+                document.getElementById('regexAnchor').value = 'b0b1400';
+                runRegexTest();
+            }
+        }
+
+        function pyFlagsToJs(f) {
+            // Map Python re flags to JS RegExp flags. 'x' (verbose) is not supported in JS.
+            let out = '';
+            for (const ch of (f || '').toLowerCase()) {
+                if (ch === 'i') out += 'i';
+                else if (ch === 's') out += 's';
+                else if (ch === 'm') out += 'm';
+                // 'x' silently dropped for the JS-side tester.
+            }
+            return out;
+        }
+
+        function runRegexTest() {
+            const pat = document.getElementById('regexPattern').value;
+            const flags = document.getElementById('regexFlags').value;
+            const anchor = document.getElementById('regexAnchor').value.trim().toLowerCase();
+            const input = document.getElementById('regexTestInput').value.trim().toLowerCase();
+            const status = document.getElementById('regexTestStatus');
+            const detail = document.getElementById('regexTestDetail');
+            detail.innerHTML = '';
+
+            if (!pat) {
+                status.innerText = '— (no pattern)';
+                status.style.color = '#8b949e';
+                return;
+            }
+            let re;
+            try {
+                re = new RegExp(pat, pyFlagsToJs(flags));
+            } catch (e) {
+                status.innerText = 'invalid regex';
+                status.style.color = '#f85149';
+                detail.innerText = String(e.message || e);
+                return;
+            }
+            if (!input) {
+                status.innerText = '— (paste a hash)';
+                status.style.color = '#8b949e';
+                return;
+            }
+            const anchorOk = !anchor || input.indexOf(anchor) !== -1;
+            const m = re.exec(input);
+            if (m && anchorOk) {
+                status.innerText = '✓ matches';
+                status.style.color = '#3fb950';
+                detail.innerHTML = `match=<span style="color:#79c0ff;">${m[0]}</span> at index ${m.index}` +
+                    (m.length > 1 ? `<br>groups: ${JSON.stringify(m.slice(1))}` : '');
+            } else if (m && !anchorOk) {
+                status.innerText = '✗ regex matches but anchor missing';
+                status.style.color = '#f0883e';
+                detail.innerText = `Anchor '${anchor}' not found in hash. The GPU would never emit this hash.`;
+            } else {
+                status.innerText = '✗ no match';
+                status.style.color = '#f85149';
+            }
+        }
+
+        function collectRegex() {
+            const pattern = document.getElementById('regexPattern').value;
+            const flags = document.getElementById('regexFlags').value.toLowerCase().replace(/[^ismx]/g, '');
+            const anchor = document.getElementById('regexAnchor').value.trim().toLowerCase();
+            if (!pattern) { alert('Regex pattern cannot be empty.'); return null; }
+            if (pattern.length > 256) { alert('Regex pattern exceeds 256 chars.'); return null; }
+            if (!/^[0-9a-f]{1,16}$/.test(anchor)) {
+                alert('GPU pre-filter anchor must be 1-16 lowercase hex chars.');
+                return null;
+            }
+            try { new RegExp(pattern, pyFlagsToJs(flags)); }
+            catch (e) { alert('Invalid regex: ' + (e.message || e)); return null; }
+            return { pattern, flags, anchor };
+        }
+
+        function onCustomToggle() {
+            const on = document.getElementById('customMode').checked;
+            document.getElementById('customControls').style.display = on ? 'block' : 'none';
+            document.getElementById('suiteLabel').style.display = on ? 'none' : '';
+            if (on && document.getElementById('groupsList').children.length === 0) {
+                // Default example: 513 AND (b0b1400 OR 626f62696e6f75)
+                addGroup([{ position: 'front', value: '513' }]);
+                addGroup([{ position: 'any',   value: 'b0b1400' },
+                         { position: 'any',   value: '626f62696e6f75' }]);
+            }
+            updateExprPreview();
+        }
+
+        function addGroup(initialRows) {
+            const list = document.getElementById('groupsList');
+            const groupCount = list.querySelectorAll('.group-card').length;
+            const card = document.createElement('div');
+            card.className = 'group-card';
+            card.style.cssText = 'background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px;';
+            card.innerHTML = `
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                    <span style="color:#79c0ff; font-size:12px; font-weight:bold; letter-spacing:0.5px;">${groupCount === 0 ? 'GROUP 1' : 'AND GROUP ' + (groupCount + 1)} <span style="color:#8b949e; font-weight:normal;">(rows OR-ed)</span></span>
+                    <div style="display:flex; gap:6px;">
+                        <button class="g-add-or" style="background:#238636; color:white; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px;">+ OR row</button>
+                        <button class="g-remove" style="background:#da3633; color:white; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px;">Remove group</button>
+                    </div>
+                </div>
+                <div class="g-rows" style="display:flex; flex-direction:column; gap:4px;"></div>
+            `;
+            list.appendChild(card);
+            card.querySelector('.g-add-or').addEventListener('click', () => { addConstraintRow(card); updateExprPreview(); });
+            card.querySelector('.g-remove').addEventListener('click', () => { card.remove(); refreshGroupLabels(); updateExprPreview(); });
+            const rows = initialRows && initialRows.length ? initialRows : [{}];
+            for (const r of rows) addConstraintRow(card, r.position, r.value);
+        }
+
+        function refreshGroupLabels() {
+            const cards = document.querySelectorAll('#groupsList .group-card');
+            cards.forEach((c, i) => {
+                const span = c.querySelector('span');
+                if (!span) return;
+                span.innerHTML = `${i === 0 ? 'GROUP 1' : 'AND GROUP ' + (i + 1)} <span style="color:#8b949e; font-weight:normal;">(rows OR-ed)</span>`;
+            });
+        }
+
+        function addConstraintRow(card, pos, val) {
+            const rows = card.querySelector('.g-rows');
+            const row = document.createElement('div');
+            row.className = 'constraint-row';
+            row.style.cssText = 'display:flex; gap:8px; align-items:center;';
+            row.innerHTML = `
+                <span style="color:#6e7681; font-size:11px; min-width:24px;">${rows.children.length === 0 ? '' : 'OR'}</span>
+                <select class="c-pos" style="background:#21262d; color:#c9d1d9; border:1px solid #30363d; padding:6px; border-radius:4px;">
+                    <option value="front">Front (starts with)</option>
+                    <option value="back">Back (ends with)</option>
+                    <option value="any">Any (contains)</option>
+                </select>
+                <input class="c-val" type="text" maxlength="16" placeholder="hex (max 16, lowercase)" style="flex:1; min-width:150px; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; padding:6px 8px; border-radius:4px; font-family:ui-monospace,monospace;">
+                <button class="c-remove" style="background:#6e7681; color:white; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; font-size:11px;">×</button>
+            `;
+            rows.appendChild(row);
+            const sel = row.querySelector('.c-pos');
+            const inp = row.querySelector('.c-val');
+            if (pos) sel.value = pos;
+            if (val) inp.value = val;
+            inp.addEventListener('input', () => {
+                inp.value = inp.value.toLowerCase().replace(/[^0-9a-f]/g, '').slice(0, 16);
+                updateExprPreview();
+            });
+            sel.addEventListener('change', updateExprPreview);
+            row.querySelector('.c-remove').addEventListener('click', () => {
+                row.remove();
+                // Refresh "OR" labels in this group.
+                rows.querySelectorAll('.constraint-row').forEach((r, i) => {
+                    const lbl = r.querySelector('span');
+                    if (lbl) lbl.innerText = i === 0 ? '' : 'OR';
+                });
+                updateExprPreview();
+            });
+        }
+
+        function collectGroups() {
+            const cards = document.querySelectorAll('#groupsList .group-card');
+            const groups = [];
+            for (const card of cards) {
+                const rows = card.querySelectorAll('.constraint-row');
+                const group = [];
+                for (const r of rows) {
+                    const position = r.querySelector('.c-pos').value;
+                    const value = r.querySelector('.c-val').value.trim().toLowerCase();
+                    if (!value) continue;
+                    if (!/^[0-9a-f]{1,16}$/.test(value)) {
+                        alert(`Invalid constraint "${value}". Must be 1-16 lowercase hex chars.`);
+                        return null;
+                    }
+                    group.push({ position, value });
+                }
+                if (group.length > 0) groups.push(group);
+            }
+            if (groups.length === 0) {
+                alert('Add at least one constraint or disable Custom Search.');
+                return null;
+            }
+            return groups;
+        }
+
+        function updateExprPreview() {
+            const groups = [];
+            const cards = document.querySelectorAll('#groupsList .group-card');
+            for (const card of cards) {
+                const rows = card.querySelectorAll('.constraint-row');
+                const parts = [];
+                for (const r of rows) {
+                    const position = r.querySelector('.c-pos').value;
+                    const value = r.querySelector('.c-val').value.trim().toLowerCase();
+                    if (!value) continue;
+                    parts.push(`${position}:${value}`);
+                }
+                if (parts.length === 0) continue;
+                groups.push(parts.length === 1 ? parts[0] : '(' + parts.join(' OR ') + ')');
+            }
+            const el = document.getElementById('exprPreview');
+            el.innerText = groups.length ? 'Expression: ' + groups.join(' AND ') : '';
         }
 
         function submitMatch(matchId) { ws.send(JSON.stringify({ command: 'submit_match', match_id: matchId })); }
+
+        function saveMatchFile(matchId) {
+            const match = historyData.find(d => d.match_id === matchId);
+            if (!match) return;
+            const data = {
+                match_id: match.match_id,
+                origin_hash: match.origin_hash,
+                iterations: match.iterations,
+                peak: match.peak,
+                bin: match.bin,
+                rle: computeRLE(match.bin),
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `conway_${match.origin_hash.substring(0, 16)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
 
         let totalHits = 0, successes = 0, bestIters = 0, historyData = [], sortKey = 'iterations', sortDir = -1;
 
@@ -249,7 +559,14 @@ HTML = """
                 row.style.borderBottom = "1px solid #30363d";
                 const tStr = new Date(d.time).toLocaleTimeString();
                 
-                let actionBtn = d.uploaded ? `<span style="color: #3fb950; font-size: 11px;">Sent</span>` : `<button onclick="submitMatch('${d.match_id}')" style="background: #1f6feb; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;">Send</button>`;
+                let actionBtn;
+                if (d.custom) {
+                    actionBtn = `<button onclick="saveMatchFile('${d.match_id}')" style="background: #6e40c9; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;">Save File</button>`;
+                } else if (d.uploaded) {
+                    actionBtn = `<span style="color: #3fb950; font-size: 11px;">Sent</span>`;
+                } else {
+                    actionBtn = `<button onclick="submitMatch('${d.match_id}')" style="background: #1f6feb; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;">Send</button>`;
+                }
                 let inspectBtn = `<button onclick="inspectMatch('${d.match_id}')" style="background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; margin-left: 5px;">Inspect</button>`;
                 let actionCell = `<div style="display: flex; align-items: center;">${actionBtn}${inspectBtn}</div>`;
                 
@@ -285,7 +602,7 @@ HTML = """
                 if (data.iterations > bestIters) { bestIters = data.iterations; document.getElementById('bestIters').innerText = bestIters; }
                 let bucket = Math.floor(data.iterations / 100) * 100;
                 iterHistData[bucket] = (iterHistData[bucket] || 0) + 1;
-                historyData.push({ match_id: data.match_id, origin_hash: data.origin_hash, iterations: data.iterations, peak: data.peak, uploaded: data.uploaded, time: data.time || Date.now(), bin: data.bin });
+                historyData.push({ match_id: data.match_id, origin_hash: data.origin_hash, iterations: data.iterations, peak: data.peak, uploaded: data.uploaded, time: data.time || Date.now(), bin: data.bin, custom: !!data.custom });
                 if (historyData.length > 500) {
                     const uploaded = historyData.filter(d => d.uploaded), others = historyData.filter(d => !d.uploaded);
                     others.sort((a, b) => b.iterations !== a.iterations ? b.iterations - a.iterations : (b.peak !== a.peak ? b.peak - a.peak : b.time - a.time));
@@ -310,7 +627,7 @@ HTML = """
                     }
                 }
                 for (const m of data.items) {
-                    historyData.push({ match_id: m.match_id, origin_hash: m.origin_hash, iterations: m.iterations, peak: m.peak, uploaded: m.uploaded, time: m.time || now, bin: m.bin });
+                    historyData.push({ match_id: m.match_id, origin_hash: m.origin_hash, iterations: m.iterations, peak: m.peak, uploaded: m.uploaded, time: m.time || now, bin: m.bin, custom: !!m.custom });
                 }
                 document.getElementById('bestIters').innerText = bestIters;
                 if (historyData.length > 500) {
@@ -324,12 +641,20 @@ HTML = """
                 if (e) { e.uploaded = data.uploaded; scheduleRender(); }
             } else if (data.type === 'state_update') {
                 const r = data.is_running;
-                ['btnStart','btnStop','suiteSelect','blocks','threads','ipt','workers'].forEach(id => document.getElementById(id).disabled = id==='btnStop' ? !r : r);
+                ['btnStart','btnStop','suiteSelect','blocks','threads','ipt','workers','customMode'].forEach(id => document.getElementById(id).disabled = id==='btnStop' ? !r : r);
+                document.querySelectorAll('input[name="customKind"]').forEach(el => el.disabled = r);
+                ['regexPattern','regexFlags','regexAnchor'].forEach(id => { const el = document.getElementById(id); if (el) el.disabled = r; });
             }
         };
 
         ws.onopen = () => logToConsole("Connected to GPU backend");
         ws.onclose = () => logToConsole("Disconnected. Refresh to reconnect.");
+
+        // Live regex tester: re-run on any input change in the regex panel.
+        ['regexPattern', 'regexFlags', 'regexAnchor', 'regexTestInput'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('input', runRegexTest);
+        });
     </script>
 </body>
 </html>
@@ -460,18 +785,74 @@ async def websocket_endpoint(websocket: WebSocket):
                 threads = max(32, int(msg.get("threads", 256)))
                 ipt = max(1, int(msg.get("ipt", 64)))
                 workers = max(1, int(msg.get("workers", 4)))
+                custom_mode = bool(msg.get("custom_mode", False))
+                groups = msg.get("groups") or []
+                regex_payload = msg.get("regex") or None
+                use_regex = bool(custom_mode and regex_payload and regex_payload.get("pattern"))
+                if custom_mode:
+                    if use_regex:
+                        if groups:
+                            await broadcast_log("Custom mode: provide either groups OR regex, not both.")
+                            continue
+                        pattern = str(regex_payload.get("pattern", ""))
+                        flags_str = str(regex_payload.get("flags", "")).lower()
+                        anchor = str(regex_payload.get("anchor", "")).lower().strip()
+                        if not pattern or len(pattern) > 256:
+                            await broadcast_log("Regex pattern must be 1-256 chars.")
+                            continue
+                        if any(ch not in "ismx" for ch in flags_str if ch.strip()):
+                            await broadcast_log("Regex flags: only i, s, m, x allowed.")
+                            continue
+                        if not anchor or len(anchor) > 16 or any(ch not in "0123456789abcdef" for ch in anchor):
+                            await broadcast_log("Regex anchor must be 1-16 lowercase hex chars.")
+                            continue
+                        try:
+                            import re as _re
+                            _re.compile(pattern)
+                        except _re.error as e:
+                            await broadcast_log(f"Invalid regex: {e}")
+                            continue
+                    else:
+                        if not isinstance(groups, list) or not groups:
+                            await broadcast_log("Custom mode requires at least one group (or a regex).")
+                            continue
+                        if len(groups) > 16:
+                            await broadcast_log("At most 16 groups supported.")
+                            continue
+                        bad = False
+                        total = 0
+                        for gid, g in enumerate(groups):
+                            if not isinstance(g, list) or not g:
+                                await broadcast_log(f"Group {gid} must be a non-empty list.")
+                                bad = True; break
+                            for c in g:
+                                v = str(c.get("value", "")).lower()
+                                p = str(c.get("position", "any")).lower()
+                                if p not in ("front", "back", "any"):
+                                    await broadcast_log(f"Invalid position {p!r}.")
+                                    bad = True; break
+                                if not v or len(v) > 16 or any(ch not in "0123456789abcdef" for ch in v):
+                                    await broadcast_log(f"Invalid constraint value {v!r}.")
+                                    bad = True; break
+                                total += 1
+                            if bad: break
+                        if bad: continue
+                        if total > 64:
+                            await broadcast_log("At most 64 constraints supported in total.")
+                            continue
+                state.custom_mode = custom_mode
                 
                 async def on_log(m: str): await broadcast_log(m)
                 async def on_rate(r: float, hr: float, q: int, d: int): await broadcast({"type": "rate", "rate": r, "hits_rate": hr, "queue": q, "dropped": d})
                 async def on_hit_count(total: int): await broadcast({"type": "hit_count", "total": total})
                 async def on_match_history(mid: str, h: str, iters: int, peak: int, p: dict):
                     state.pending_payloads[mid] = p
-                    state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": int(time.time() * 1000), "bin": p.get("bin")})
+                    state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": int(time.time() * 1000), "bin": p.get("bin"), "custom": state.custom_mode})
                 async def on_match_history_batch(items):
                     now_ms = int(time.time() * 1000)
                     for mid, h, iters, peak, p in items:
                         state.pending_payloads[mid] = p
-                        state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": now_ms, "bin": p.get("bin")})
+                        state.match_buffer.append({"match_id": mid, "origin_hash": h, "iterations": iters, "peak": peak, "uploaded": False, "time": now_ms, "bin": p.get("bin"), "custom": state.custom_mode})
                 async def on_stop():
                     state.miner = None
                     if state.match_flush_task:
@@ -488,7 +869,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 await broadcast_state()
                 if state.match_flush_task is None or state.match_flush_task.done():
                     state.match_flush_task = asyncio.create_task(_match_flusher())
-                state.miner_task = asyncio.create_task(state.miner.run(target_suite, blocks, threads, ipt, workers))
+                state.miner_task = asyncio.create_task(
+                    state.miner.run(
+                        target_suite, blocks, threads, ipt, workers,
+                        custom_mode,
+                        [] if use_regex else groups,
+                        regex_payload if use_regex else None,
+                    )
+                )
 
             elif cmd == "stop":
                 if state.miner:
@@ -500,6 +888,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload = state.pending_payloads.get(mid)
                 if not payload:
                     await broadcast_log(f"Manual submit: match not found.")
+                    continue
+                if str(payload.get("nist_pulse_id", "")).startswith("custom:"):
+                    await broadcast_log("Submit blocked: custom-mode matches cannot be submitted, use Save File instead.")
                     continue
                 await broadcast_log(f"Submitting match {mid[:8]}...")
                 ok = await submit_payload(payload)

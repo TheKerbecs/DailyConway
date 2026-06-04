@@ -3,27 +3,56 @@ import asyncio
 import concurrent.futures
 import multiprocessing
 import os
+import re
 import sys
 import time
 import uuid
 import numpy as np
 
-# --- DLL discovery for pip-installed CUDA libs (must run before cupy import) ---
+# --- DLL/shared-library discovery for pip-installed CUDA libs (must run before cupy import) ---
 def _add_nvidia_dll_dirs():
     try:
         import importlib.util
         spec = importlib.util.find_spec("nvidia")
         if spec is None or not spec.submodule_search_locations:
             return
+        is_windows = sys.platform.startswith("win")
+        lib_dirs = []
+        so_files = []
         for root in spec.submodule_search_locations:
             for dirpath, _, filenames in os.walk(root):
-                if any(f.lower().endswith(".dll") for f in filenames):
-                    if hasattr(os, "add_dll_directory"):
-                        try:
-                            os.add_dll_directory(dirpath)
-                        except OSError:
-                            pass
-                    os.environ["PATH"] = dirpath + os.pathsep + os.environ.get("PATH", "")
+                has_dll = any(f.lower().endswith(".dll") for f in filenames)
+                so_here = [f for f in filenames if ".so" in f]
+                if is_windows and has_dll:
+                    lib_dirs.append(dirpath)
+                if (not is_windows) and so_here:
+                    lib_dirs.append(dirpath)
+                    so_files.extend(os.path.join(dirpath, f) for f in so_here)
+
+        if is_windows:
+            for d in lib_dirs:
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(d)
+                    except OSError:
+                        pass
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        else:
+            # Make subsequent dlopen("libfoo.so.X") resolve from these dirs.
+            existing = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(lib_dirs + ([existing] if existing else []))
+            # Preload .so files so that dlopen by soname finds the already-loaded copy.
+            import ctypes
+            seen = set()
+            for path in so_files:
+                base = os.path.basename(path)
+                if base in seen:
+                    continue
+                seen.add(base)
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
     except Exception:
         pass
 _add_nvidia_dll_dirs()
@@ -93,7 +122,11 @@ __global__ void mine(
     const uint8_t* __restrict__ salt, int salt_len,
     const uint8_t* __restrict__ targets, const int* __restrict__ target_lens, int n_targets,
     uint64_t base_seed, int iters_per_thread,
-    unsigned int* result_count, uint8_t* result_data, int max_results
+    unsigned int* result_count, uint8_t* result_data, int max_results,
+    int custom_mode,
+    const uint8_t* __restrict__ c_data, const int* __restrict__ c_lens,
+    const int* __restrict__ c_positions, const int* __restrict__ c_group_ids,
+    int n_constraints, int n_groups
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t s0 = base_seed ^ ((uint64_t)tid * 0x9E3779B97F4A7C15ULL + 1ULL);
@@ -153,32 +186,97 @@ __global__ void mine(
             hex[i*8+7] = hexchars[ v        & 0xfu];
         }
 
-        for (int t = 0; t < n_targets; t++) {
-            int tlen = target_lens[t];
-            const uint8_t* tgt = targets + t * 16;
-            int last = 64 - tlen;
-            for (int j = 0; j <= last; j++) {
-                bool ok = true;
-                #pragma unroll 8
-                for (int k = 0; k < tlen; k++) {
-                    if (hex[j+k] != tgt[k]) { ok = false; break; }
-                }
-                if (ok) {
-                    unsigned int slot = atomicAdd(result_count, 1u);
-                    if (slot < (unsigned int)max_results) {
-                        uint8_t* out = result_data + (size_t)slot * 96;
-                        #pragma unroll
-                        for (int i = 0; i < 8; i++) out[i]    = (uint8_t)(r0 >> (56 - i*8));
-                        #pragma unroll
-                        for (int i = 0; i < 8; i++) out[8+i]  = (uint8_t)(r1 >> (56 - i*8));
-                        #pragma unroll
-                        for (int i = 0; i < 8; i++) out[16+i] = (uint8_t)(r2 >> (56 - i*8));
-                        #pragma unroll
-                        for (int i = 0; i < 8; i++) out[24+i] = (uint8_t)(r3 >> (56 - i*8));
-                        #pragma unroll
-                        for (int i = 0; i < 64; i++) out[32+i] = hex[i];
+        if (custom_mode) {
+            // Each constraint belongs to a group. A group is satisfied if ANY of its
+            // constraints match (OR). All groups must be satisfied (AND).
+            bool group_ok[16];
+            #pragma unroll
+            for (int g = 0; g < 16; g++) group_ok[g] = false;
+
+            for (int c = 0; c < n_constraints; c++) {
+                int gid = c_group_ids[c];
+                if (gid < 0 || gid >= 16 || gid >= n_groups) continue;
+                if (group_ok[gid]) continue;  // already satisfied; skip work
+                int clen = c_lens[c];
+                int cpos = c_positions[c];  // 0=front, 1=back, 2=any
+                const uint8_t* cstr = c_data + c * 16;
+                bool this_ok = false;
+                if (cpos == 0) {
+                    this_ok = true;
+                    for (int k = 0; k < clen; k++) {
+                        if (hex[k] != cstr[k]) { this_ok = false; break; }
                     }
-                    goto next_iter;
+                } else if (cpos == 1) {
+                    int off = 64 - clen;
+                    if (off >= 0) {
+                        this_ok = true;
+                        for (int k = 0; k < clen; k++) {
+                            if (hex[off + k] != cstr[k]) { this_ok = false; break; }
+                        }
+                    }
+                } else {
+                    int last = 64 - clen;
+                    for (int j = 0; j <= last; j++) {
+                        bool ok = true;
+                        for (int k = 0; k < clen; k++) {
+                            if (hex[j + k] != cstr[k]) { ok = false; break; }
+                        }
+                        if (ok) { this_ok = true; break; }
+                    }
+                }
+                if (this_ok) group_ok[gid] = true;
+            }
+
+            bool all_ok = (n_groups > 0);
+            for (int g = 0; g < n_groups; g++) {
+                if (!group_ok[g]) { all_ok = false; break; }
+            }
+
+            if (all_ok) {
+                unsigned int slot = atomicAdd(result_count, 1u);
+                if (slot < (unsigned int)max_results) {
+                    uint8_t* out = result_data + (size_t)slot * 96;
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) out[i]    = (uint8_t)(r0 >> (56 - i*8));
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) out[8+i]  = (uint8_t)(r1 >> (56 - i*8));
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) out[16+i] = (uint8_t)(r2 >> (56 - i*8));
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) out[24+i] = (uint8_t)(r3 >> (56 - i*8));
+                    #pragma unroll
+                    for (int i = 0; i < 64; i++) out[32+i] = hex[i];
+                }
+                goto next_iter;
+            }
+        } else {
+            for (int t = 0; t < n_targets; t++) {
+                int tlen = target_lens[t];
+                const uint8_t* tgt = targets + t * 16;
+                int last = 64 - tlen;
+                for (int j = 0; j <= last; j++) {
+                    bool ok = true;
+                    #pragma unroll 8
+                    for (int k = 0; k < tlen; k++) {
+                        if (hex[j+k] != tgt[k]) { ok = false; break; }
+                    }
+                    if (ok) {
+                        unsigned int slot = atomicAdd(result_count, 1u);
+                        if (slot < (unsigned int)max_results) {
+                            uint8_t* out = result_data + (size_t)slot * 96;
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) out[i]    = (uint8_t)(r0 >> (56 - i*8));
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) out[8+i]  = (uint8_t)(r1 >> (56 - i*8));
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) out[16+i] = (uint8_t)(r2 >> (56 - i*8));
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) out[24+i] = (uint8_t)(r3 >> (56 - i*8));
+                            #pragma unroll
+                            for (int i = 0; i < 64; i++) out[32+i] = hex[i];
+                        }
+                        goto next_iter;
+                    }
                 }
             }
         }
@@ -290,7 +388,7 @@ class GPUMiner:
             except Exception as e:
                 await self._log(f"GoL failed: {e}")
 
-    async def run(self, target_suite: str, blocks: int, threads: int, ipt: int, n_workers: int):
+    async def run(self, target_suite: str, blocks: int, threads: int, ipt: int, n_workers: int, custom_mode: bool = False, groups: list[list[dict]] | None = None, regex: dict | None = None):
         """
         Orchestrate the continuous mining loop.
 
@@ -300,7 +398,17 @@ class GPUMiner:
             threads (int): The number of threads per block.
             ipt (int): Iterations per thread (IPT). Hashes evaluated per thread.
             n_workers (int): Number of CPU workers for the process pool.
-        
+            custom_mode (bool): When True, ignore NIST salt and date-based targets and instead
+                require all `groups` to match (AND of groups, OR within a group), or `regex`.
+            groups (list[list[dict]] | None): Groups for custom_mode (mutually exclusive with regex).
+                Each group is a list of {"position": "front"|"back"|"any", "value": "<hex>"}
+                entries that are OR'd; groups are AND'd. Up to 16 groups, up to 64 constraints
+                in total, each value up to 16 lowercase hex chars.
+            regex (dict | None): {"pattern": "<py-regex>", "flags": "<imsx-subset>",
+                "anchor": "<lowercase hex 1..16>"}. The GPU pre-filters by `anchor` (must appear
+                anywhere in the 64-char hex), and the CPU validates each candidate with the
+                full regex via re.search.
+
         Raises:
             asyncio.CancelledError: When the overarching async task is canceled.
             Exception: If an unhandled error occurs during GPU launch or CPU processing.
@@ -311,27 +419,134 @@ class GPUMiner:
         process_pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_workers)
         
         try:
-            await self._log("Fetching NIST pulse from logic module...")
-            pulse_uri, salt = await asyncio.to_thread(fetch_nist_pulse)
-            await self._log(f"Salt: {salt[:24]}... (len {len(salt)})")
+            # Flat list of (pos_code, hex_value, group_id).
+            normalized_constraints: list[tuple[int, str, int]] = []
+            n_groups = 0
+            compiled_regex: re.Pattern[str] | None = None
+            if custom_mode:
+                pos_map = {"front": 0, "back": 1, "any": 2}
+                use_regex = regex is not None and bool(regex.get("pattern"))
+                if use_regex and groups:
+                    raise ValueError("Custom mode: provide either groups OR regex, not both.")
 
-            targets = get_target_strings(target_suite)
-            await self._log(f"Targets: {targets}")
+                if use_regex:
+                    pattern = str(regex.get("pattern", ""))  # type: ignore[union-attr]
+                    flags_str = str(regex.get("flags", "")).lower()  # type: ignore[union-attr]
+                    anchor = str(regex.get("anchor", "")).lower().strip()  # type: ignore[union-attr]
+                    if not pattern:
+                        raise ValueError("Regex pattern cannot be empty.")
+                    if len(pattern) > 256:
+                        raise ValueError("Regex pattern exceeds 256 chars.")
+                    if not anchor:
+                        raise ValueError("Regex mode requires a GPU pre-filter hex anchor (1-16 lowercase hex chars).")
+                    if len(anchor) > 16 or any(ch not in "0123456789abcdef" for ch in anchor):
+                        raise ValueError(f"Anchor {anchor!r} must be 1-16 lowercase hex chars.")
+                    flag_val = 0
+                    for ch in flags_str:
+                        if ch == "i": flag_val |= re.IGNORECASE
+                        elif ch == "s": flag_val |= re.DOTALL
+                        elif ch == "m": flag_val |= re.MULTILINE
+                        elif ch == "x": flag_val |= re.VERBOSE
+                        elif ch.strip() == "":
+                            continue
+                        else:
+                            raise ValueError(f"Unsupported regex flag {ch!r}; allowed: i, s, m, x.")
+                    compiled_regex = re.compile(pattern, flag_val)
+                    # Use the anchor as a single 'any' constraint forming one group.
+                    normalized_constraints.append((pos_map["any"], anchor, 0))
+                    n_groups = 1
+                    pulse_uri = f"custom:regex:/{pattern}/{flags_str} anchor:{anchor}"
+                    salt = ""
+                    await self._log("Custom mode: regex (skipping NIST pulse, no salt).")
+                    await self._log(f"GPU pre-filter anchor: 'any:{anchor}'")
+                    await self._log(f"CPU regex: /{pattern}/{flags_str}")
+                    targets: list[str] = []
+                else:
+                    raw_groups = groups or []
+                    # Drop empty groups silently.
+                    raw_groups = [g for g in raw_groups if g]
+                    if not raw_groups:
+                        raise ValueError("Custom mode requires at least one non-empty group (or a regex).")
+                    if len(raw_groups) > 16:
+                        raise ValueError("At most 16 groups supported.")
+                    for gid, group in enumerate(raw_groups):
+                        if not isinstance(group, list) or not group:
+                            raise ValueError(f"Group {gid} must be a non-empty list.")
+                        for c in group:
+                            pos = str(c.get("position", "any")).lower()
+                            val = str(c.get("value", "")).lower().strip()
+                            if pos not in pos_map:
+                                raise ValueError(f"Invalid position {pos!r}.")
+                            if not val:
+                                raise ValueError("Constraint value cannot be empty.")
+                            if len(val) > 16:
+                                raise ValueError(f"Constraint {val!r} exceeds 16 hex chars.")
+                            if any(ch not in "0123456789abcdef" for ch in val):
+                                raise ValueError(f"Constraint {val!r} must be lowercase hex.")
+                            normalized_constraints.append((pos_map[pos], val, gid))
+                    if len(normalized_constraints) > 64:
+                        raise ValueError("At most 64 constraints supported in total.")
+                    n_groups = len(raw_groups)
+
+                    def _fmt_group(g):
+                        parts = [f"{['front','back','any'][p]}:{v}" for p, v, _ in g]
+                        return "(" + " OR ".join(parts) + ")" if len(parts) > 1 else parts[0]
+                    grouped: list[list] = [[] for _ in range(n_groups)]
+                    for entry in normalized_constraints:
+                        grouped[entry[2]].append(entry)
+                    desc = " AND ".join(_fmt_group(g) for g in grouped)
+                    pulse_uri = f"custom:{desc}"
+                    salt = ""
+                    await self._log("Custom mode: skipping NIST pulse, no salt.")
+                    await self._log(f"Custom expression: {desc}")
+                    targets = []
+            else:
+                await self._log("Fetching NIST pulse from logic module...")
+                pulse_uri, salt = await asyncio.to_thread(fetch_nist_pulse)
+                await self._log(f"Salt: {salt[:24]}... (len {len(salt)})")
+                targets = get_target_strings(target_suite)
+                await self._log(f"Targets: {targets}")
 
             await self._log("Compiling CUDA kernel...")
             await asyncio.to_thread(self._compile)
 
             salt_bytes = salt.encode("ascii")
-            d_salt = cp.asarray(np.frombuffer(salt_bytes, dtype=np.uint8))
+            d_salt = cp.asarray(np.frombuffer(salt_bytes, dtype=np.uint8)) if len(salt_bytes) > 0 else cp.zeros(1, dtype=cp.uint8)
 
-            target_arr = np.zeros((len(targets), 16), dtype=np.uint8)
-            target_lens = np.zeros(len(targets), dtype=np.int32)
-            for i, t in enumerate(targets):
-                tb = t.encode("ascii")
-                target_arr[i, : len(tb)] = np.frombuffer(tb, dtype=np.uint8)
-                target_lens[i] = len(tb)
-            d_targets = cp.asarray(target_arr.flatten())
-            d_target_lens = cp.asarray(target_lens)
+            if len(targets) > 0:
+                target_arr = np.zeros((len(targets), 16), dtype=np.uint8)
+                target_lens = np.zeros(len(targets), dtype=np.int32)
+                for i, t in enumerate(targets):
+                    tb = t.encode("ascii")
+                    target_arr[i, : len(tb)] = np.frombuffer(tb, dtype=np.uint8)
+                    target_lens[i] = len(tb)
+                d_targets = cp.asarray(target_arr.flatten())
+                d_target_lens = cp.asarray(target_lens)
+            else:
+                d_targets = cp.zeros(16, dtype=cp.uint8)
+                d_target_lens = cp.zeros(1, dtype=cp.int32)
+
+            n_constraints = len(normalized_constraints)
+            if n_constraints > 0:
+                c_arr = np.zeros((n_constraints, 16), dtype=np.uint8)
+                c_lens = np.zeros(n_constraints, dtype=np.int32)
+                c_pos = np.zeros(n_constraints, dtype=np.int32)
+                c_gids = np.zeros(n_constraints, dtype=np.int32)
+                for i, (pos_code, val, gid) in enumerate(normalized_constraints):
+                    vb = val.encode("ascii")
+                    c_arr[i, : len(vb)] = np.frombuffer(vb, dtype=np.uint8)
+                    c_lens[i] = len(vb)
+                    c_pos[i] = pos_code
+                    c_gids[i] = gid
+                d_c_data = cp.asarray(c_arr.flatten())
+                d_c_lens = cp.asarray(c_lens)
+                d_c_pos = cp.asarray(c_pos)
+                d_c_gids = cp.asarray(c_gids)
+            else:
+                d_c_data = cp.zeros(16, dtype=cp.uint8)
+                d_c_lens = cp.zeros(1, dtype=cp.int32)
+                d_c_pos = cp.zeros(1, dtype=cp.int32)
+                d_c_gids = cp.zeros(1, dtype=cp.int32)
 
             d_result_count = cp.zeros(1, dtype=cp.uint32)
             d_result_data = cp.zeros(self.max_results * 96, dtype=cp.uint8)
@@ -359,6 +574,9 @@ class GPUMiner:
             n_targets_arg = np.int32(len(targets))
             max_res_arg = np.int32(self.max_results)
             ipt_arg = np.int32(ipt)
+            custom_mode_arg = np.int32(1 if custom_mode else 0)
+            n_constraints_arg = np.int32(n_constraints)
+            n_groups_arg = np.int32(n_groups)
             blocks_t = (blocks,)
             threads_t = (threads,)
 
@@ -391,7 +609,10 @@ class GPUMiner:
                         (d_salt, salt_len_arg,
                          d_targets, d_target_lens, n_targets_arg,
                          seed_arg, ipt_arg,
-                         d_result_count, d_result_data, max_res_arg),
+                         d_result_count, d_result_data, max_res_arg,
+                         custom_mode_arg,
+                         d_c_data, d_c_lens, d_c_pos, d_c_gids,
+                         n_constraints_arg, n_groups_arg),
                     )
                     cp.cuda.Stream.null.synchronize()
                     n = int(d_result_count.get()[0])
@@ -422,16 +643,32 @@ class GPUMiner:
                         if b_bytes in seen_b: continue
                         seen_b.add(b_bytes)
                         gpu_hex = bytes(rec[32:96]).decode("ascii")
+
+                        if compiled_regex is not None and compiled_regex.search(gpu_hex) is None:
+                            # GPU pre-filter passed but full regex did not — discard silently.
+                            continue
+
                         total_hits += 1
 
-                        hit_target = None
-                        hit_idx = -1
-                        for t in targets:
-                            j = gpu_hex.find(t)
-                            if j != -1:
-                                hit_target, hit_idx = t, j
-                                break
-                        if hit_target is None: continue
+                        if custom_mode:
+                            if compiled_regex is not None:
+                                m = compiled_regex.search(gpu_hex)
+                                hit_target = m.group(0) if m else "regex"
+                                hit_idx = m.start() if m else -1
+                            else:
+                                # Use first constraint as the metadata label.
+                                first_val = normalized_constraints[0][1] if normalized_constraints else "custom"
+                                hit_target = first_val
+                                hit_idx = gpu_hex.find(first_val)
+                        else:
+                            hit_target = None
+                            hit_idx = -1
+                            for t in targets:
+                                j = gpu_hex.find(t)
+                                if j != -1:
+                                    hit_target, hit_idx = t, j
+                                    break
+                            if hit_target is None: continue
 
                         b_str = b_str_from_bytes(b_bytes)
                         try:
