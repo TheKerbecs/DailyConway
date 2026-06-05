@@ -1,0 +1,13 @@
+{
+  "owner": "Bobinou",
+  "output_dir": "/home/robin/Documents/DailyConway/hits",
+  "blocks": 2048,
+  "threads": 256,
+  "ipt": 256,
+  "workers": 4,
+  "groups": [
+    [{"position": "front", "value": "513"}],
+    [{"position": "any", "value": "b0b1400"},
+     {"position": "any", "value": "626f62696e6f75"}]
+  ]
+}
