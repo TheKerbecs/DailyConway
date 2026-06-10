@@ -37,8 +37,12 @@ import time
 import uuid
 from pathlib import Path
 
+from tqdm import tqdm
+
 # Ensure NIST-free custom mode and the same DLL/so discovery as website mode.
 from .miner import GPUMiner
+
+MIN_ITERS = 450
 
 
 def _bin_to_rle(b_str: str) -> str:
@@ -156,23 +160,29 @@ class _HitWriter:
         self.quiet = quiet
         self.count = 0
         self.start_ts = time.time()
+        self.pbar = tqdm(
+            bar_format="{desc}",
+            desc="mining...",
+            file=sys.stdout,
+            disable=quiet,
+        )
 
     async def on_log(self, msg: str) -> None:
-        if not self.quiet:
-            print(f"[log] {msg}", flush=True)
+        self.pbar.write(f"[log] {msg}")
 
     async def on_rate(self, rate: float, hits_rate: float, queue: int, dropped: int) -> None:
-        if self.quiet:
-            return
-        elapsed = time.time() - self.start_ts
-        print(f"[rate] {rate/1e6:6.1f} M/s  hits/s={hits_rate:5.1f}  q={queue:4d}  drop={dropped}  saved={self.count}  uptime={int(elapsed)}s",
-              flush=True)
+        elapsed = int(time.time() - self.start_ts)
+        self.pbar.set_description_str(
+            f"{rate/1e6:6.1f} Mhash/s | hits={hits_rate:5.1f}/s | q={queue:4d} | drop={dropped} | saved={self.count} | {elapsed}s"
+        )
 
     async def on_hit_count(self, total: int) -> None:
         # Logged via on_rate already; nothing to do here.
         return
 
     async def _write_one(self, mid: str, gpu_hex: str, iters: int, peak: int, payload: dict) -> None:
+        if iters <= MIN_ITERS:
+            return
         ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         # File name: {timestamp}_{iters}_{first16ofhash}.json — sortable by time then quality.
         fname = f"{ts}_{iters:05d}_{gpu_hex[:16]}_{mid[:8]}.json"
@@ -189,8 +199,7 @@ class _HitWriter:
             json.dump(record, f, indent=2)
         os.replace(tmp, path)
         self.count += 1
-        if not self.quiet:
-            print(f"[hit] iters={iters:>5} peak={peak:>4} -> {path.name}", flush=True)
+        self.pbar.write(f"[hit] iters={iters:>5} peak={peak:>4} -> {path.name}")
 
     async def on_match_history(self, mid: str, gpu_hex: str, iters: int, peak: int, payload: dict) -> None:
         await self._write_one(mid, gpu_hex, iters, peak, payload)
@@ -200,8 +209,8 @@ class _HitWriter:
             await self._write_one(mid, gpu_hex, iters, peak, payload)
 
     async def on_stop(self) -> None:
-        if not self.quiet:
-            print(f"[stop] total saved: {self.count}", flush=True)
+        self.pbar.set_description_str(f"[stop] total saved: {self.count}")
+        self.pbar.close()
 
 
 async def _amain(cfg: dict) -> None:

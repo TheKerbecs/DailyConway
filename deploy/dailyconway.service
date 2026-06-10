@@ -1,0 +1,48 @@
+# systemd unit for the headless DailyConway miner.
+#
+# Install (system-wide, requires sudo):
+#   sudo cp deploy/dailyconway.service /etc/systemd/system/dailyconway.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dailyconway.service
+#   journalctl -u dailyconway.service -f
+#
+# Or as a user service (no sudo, but stops on full logout unless lingering is enabled):
+#   loginctl enable-linger $USER
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/dailyconway.service ~/.config/systemd/user/dailyconway.service
+#   # Remove the User=/Group= lines from the user copy.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dailyconway.service
+#   journalctl --user -u dailyconway.service -f
+#
+# Edit the paths/owner before installing.
+
+[Unit]
+Description=DailyConway headless GPU miner (custom-mode, save hits to folder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robin
+Group=robin
+WorkingDirectory=/home/robin/Documents/DailyConway
+Environment=MINER_OWNER=Bobinou
+# uv resolves the project's venv automatically. Use an absolute path so PATH need not be set.
+ExecStart=/home/robin/.local/bin/uv run python -m app.headless --config /home/robin/Documents/DailyConway/headless.example.json
+Restart=on-failure
+RestartSec=5
+# Send SIGTERM, allow draining time, then SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Keep journal output but don't flood with chatter.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (loosened for GPU access via /dev/nvidia*).
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

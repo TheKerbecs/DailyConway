@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=2.4.4",
     "nvidia-cuda-nvrtc-cu11>=11.8.89",
     "torch>=2.6.0",
+    "tqdm>=4.67.0",
     "uvicorn>=0.46.0",
     "websockets>=16.0",
 ]
